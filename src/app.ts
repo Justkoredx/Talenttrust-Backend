@@ -1,117 +1,142 @@
-import express from 'express';
-import { applySecurityMiddleware } from './middleware/security';
-import { MetricsService } from './observability/metrics-service';
-import { setMetricsService } from './observability/registry';
-import { rateLimitStore } from './config/rateLimit';
-import { notFoundHandler, errorHandler } from './middleware/errorHandlers';
-import { healthRouter as legacyHealthRouter } from './routes/health';
-import { healthRouter as readinessHealthRouter } from './health';
-import { validateEnv } from './config/env.schema';
-import { createRequestLimitsMiddleware } from './middleware/requestLimits';
-import apiKeysRouter from './routes/apiKeys.routes';
-import { createContractsRouter } from './routes/contracts.routes';
-import eventsRouter from './routes/events.routes';
-import { createDisputesRouter } from './routes/disputes.routes';
-import { createMetricsRouter } from './routes/metrics.routes';
-import { metricsAuthMiddleware } from './middleware/metricsAuth';
-import reputationRouter, { createReputationRouter } from './routes/reputation.routes';
-import authRouter from './routes/auth.routes';
-import configRouter from './routes/config.routes';
-import dependencyScanRouter from './routes/dependency-scan.routes';
-import { adminRouter } from './routes/admin.routes';
-import { deployRouter } from './routes/deploy.routes';
-import rpcEventsRouter from './routes/rpcEvents.routes';
-import { webhookSubscriptionRouter } from './routes/webhook-subscription.routes';
-import { features } from './config/features';
-import { requestIdMiddleware } from './middleware/requestId';
-import { httpLoggerMiddleware } from './middleware/httpLogger';
-import { ReputationService } from './services/reputation.service';
-import { getDb } from './db/database';
-import { requestContextMiddleware } from './context';
+import express, { NextFunction, Request, Response } from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import { config, explorerUrl } from './config';
+import { EscrowStore, HttpError } from './store';
+import { openapi, docsHtml } from './openapi';
 
-interface AppFactoryOptions {
-  includeTerminalHandlers?: boolean;
-}
+const startedAt = Date.now();
 
-export function attachTerminalHandlers(app: express.Application): void {
-  app.use(notFoundHandler);
-  app.use(errorHandler);
-}
+type Handler = (req: Request, res: Response) => unknown;
+const wrap = (fn: Handler) => (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const out = fn(req, res);
+    if (out !== undefined && !res.headersSent) res.json(out);
+  } catch (err) {
+    next(err);
+  }
+};
 
-export function createApp(options?: AppFactoryOptions): express.Application {
-  const includeTerminalHandlers = options?.includeTerminalHandlers ?? true;
-  const env = validateEnv();
+const id = (req: Request) => {
+  const n = Number(req.params.id);
+  if (!Number.isInteger(n) || n < 1) throw new HttpError(400, 'invalid_id', 'id must be a positive integer');
+  return n;
+};
+
+export function createApp(store: EscrowStore = new EscrowStore().seed()) {
   const app = express();
+  app.disable('x-powered-by');
+  // CSP disabled so the /docs page can load Swagger UI from a CDN.
+  app.use(helmet({ contentSecurityPolicy: false }));
+  app.use(cors());
+  app.use(express.json({ limit: '100kb' }));
 
-  applySecurityMiddleware(app, env.CORS_ALLOWED_ORIGINS);
-
-  const metricsService = new MetricsService(
-    process.env['SERVICE_NAME'] ?? 'talenttrust-backend',
-    undefined,
-    { httpRouteLabelLimit: env.HTTP_METRICS_ROUTE_LABEL_LIMIT },
+  app.get(
+    '/',
+    wrap(() => ({
+      name: 'TalentTrust API',
+      version: config.version,
+      description: 'Milestone-based freelancer escrow API backed by a Soroban contract on Stellar.',
+      docs: '/docs',
+      openapi: '/openapi.json',
+      website: config.frontendUrl,
+      chain: { network: config.network, contractId: config.contractId, explorer: explorerUrl() },
+      endpoints: [
+        'GET  /health',
+        'GET  /docs',
+        'GET  /openapi.json',
+        'GET  /api/v1/chain',
+        'GET  /api/v1/stats',
+        'GET  /api/v1/contracts',
+        'POST /api/v1/contracts',
+        'GET  /api/v1/contracts/:id',
+        'POST /api/v1/contracts/:id/deposit',
+        'POST /api/v1/contracts/:id/milestones/:index/release',
+        'POST /api/v1/contracts/:id/dispute',
+        'POST /api/v1/contracts/:id/resolve',
+        'POST /api/v1/contracts/:id/cancel',
+        'POST /api/v1/contracts/:id/reputation',
+        'GET  /api/v1/reputation/:address',
+      ],
+    })),
   );
 
-  setMetricsService(metricsService);
+  app.get(
+    '/health',
+    wrap(() => ({
+      status: 'ok',
+      version: config.version,
+      uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
+      storage: 'in-memory',
+      timestamp: new Date().toISOString(),
+    })),
+  );
 
-  app.use(requestIdMiddleware);
-  app.use(requestContextMiddleware);
-  app.use(createRequestLimitsMiddleware());
-  app.use(express.json());
-  app.use(httpLoggerMiddleware);
-  app.use(metricsService.trackHttpRequest.bind(metricsService));
-
-  const db = getDb();
-  ReputationService.initialize(db);
-
-  app.get('/metrics', metricsAuthMiddleware, async (_req, res) => {
-    res.setHeader('Content-Type', metricsService.contentType);
-    res.status(200).send(await metricsService.getMetrics());
+  app.get('/openapi.json', wrap(() => openapi));
+  app.get(['/docs', '/docs/'], (_req, res) => {
+    res.type('html').send(docsHtml);
   });
 
-  app.use('/health', legacyHealthRouter);
-  app.use('/health', readinessHealthRouter);
-  app.use('/api/config', configRouter);
-  app.use('/api/v1', eventsRouter);
-  app.use('/api/v1/auth', metricsService.trackAuthRequest.bind(metricsService));
-  app.use('/api/v1/auth', authRouter);
-  app.use('/api/v1/api-keys', metricsService.trackApiKeysRequest.bind(metricsService));
-  app.use('/api/v1', apiKeysRouter);
-  app.use('/api/v1/contracts', createContractsRouter(metricsService));
-  app.use('/api/v1/disputes', createDisputesRouter({ metricsService }));
-  app.use('/api/v1/reputation', reputationRouter);
-  app.use('/api/v1/dependency-scan', dependencyScanRouter);
-  app.use('/api/v1', apiKeysRouter);
-  app.use('/api/v1/admin', adminRouter);
-  app.use('/api/v1/admin/deploy', deployRouter);
-  app.use('/api/v1', rpcEventsRouter);
-  if (features.webhooksEnabled) {
-    app.use('/api/v1/webhook-subscriptions', webhookSubscriptionRouter);
-  }
-  app.use('/api/v1/metrics', metricsAuthMiddleware, createMetricsRouter(metricsService));
+  const v1 = express.Router();
+  v1.get(
+    '/chain',
+    wrap(() => ({
+      network: config.network,
+      rpcUrl: config.rpcUrl,
+      contractId: config.contractId,
+      explorer: explorerUrl(),
+    })),
+  );
+  v1.get('/stats', wrap(() => store.stats()));
+  v1.get(
+    '/contracts',
+    wrap((req) => ({
+      data: store.list({
+        status: typeof req.query.status === 'string' ? req.query.status : undefined,
+        party: typeof req.query.party === 'string' ? req.query.party : undefined,
+      }),
+    })),
+  );
+  v1.post(
+    '/contracts',
+    wrap((req, res) => {
+      res.status(201).json(store.create(req.body ?? {}));
+    }),
+  );
+  v1.get('/contracts/:id', wrap((req) => store.get(id(req))));
+  v1.post('/contracts/:id/deposit', wrap((req) => store.deposit(id(req), req.body?.amount)));
+  v1.post(
+    '/contracts/:id/milestones/:index/release',
+    wrap((req) => store.release(id(req), Number(req.params.index))),
+  );
+  v1.post(
+    '/contracts/:id/dispute',
+    wrap((req) => store.openDispute(id(req), req.body?.raisedBy, req.body?.reason)),
+  );
+  v1.post('/contracts/:id/resolve', wrap((req) => store.resolveDispute(id(req), req.body?.freelancerBps)));
+  v1.post('/contracts/:id/cancel', wrap((req) => store.cancel(id(req))));
+  v1.post('/contracts/:id/reputation', wrap((req) => store.rate(id(req), req.body?.rating)));
+  v1.get('/reputation/:address', wrap((req) => store.getReputation(req.params.address)));
+  app.use('/api/v1', v1);
 
-  if (includeTerminalHandlers) {
-    attachTerminalHandlers(app);
-  }
+  app.use((req, res) => {
+    res.status(404).json({ error: 'not_found', message: `No route for ${req.method} ${req.path}`, docs: '/docs' });
+  });
 
-  const originalListen = app.listen.bind(app);
-  (app as express.Application).listen = ((...args: Parameters<express.Application['listen']>) => {
-    const server = (originalListen as (...a: unknown[]) => import('http').Server)(...args);
-    server.on('clientError', (_err: Error, socket: import('net').Socket) => {
-      if (!socket.destroyed) socket.destroy();
-    });
-    return server;
-  }) as express.Application['listen'];
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    if (err instanceof HttpError) {
+      res.status(err.status).json({ error: err.code, message: err.message });
+      return;
+    }
+    if (err && typeof err === 'object' && (err as { type?: string }).type === 'entity.parse.failed') {
+      res.status(400).json({ error: 'invalid_json', message: 'Malformed JSON body' });
+      return;
+    }
+    res.status(500).json({ error: 'internal_error', message: 'Unexpected error' });
+  });
 
   return app;
 }
 
-export function shutdownRateLimitStore(): void {
-  if (rateLimitStore && typeof (rateLimitStore as any).destroy === 'function') {
-    (rateLimitStore as any).destroy();
-    console.log('[rateLimit] Store shutdown complete');
-  }
-  if (typeof (globalThis as any).apiKeysRateLimitStore?.destroy === 'function') {
-    (globalThis as any).apiKeysRateLimitStore.destroy();
-    console.log('[rateLimit] API-key store shutdown complete');
-  }
-}
+export default createApp;
